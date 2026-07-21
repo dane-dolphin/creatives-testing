@@ -1,0 +1,205 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  creative-tester — paced media-classifier submitter + comparator.
+  Upload URLs, run them against classifier endpoints at a global 18s gap,
+  collect results via webhook push (poll fallback), store 30 days, compare.
+
+Parameters:
+  Stage:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, prod]
+  SubmitGapSeconds:
+    Type: String
+    Default: "18"
+    Description: Minimum seconds between submits to one classifier (200/hr = 18s).
+  CallbackParam:
+    Type: String
+    Default: callback_url
+    Description: Request field the classifier reads its webhook URL from (unconfirmed for dev; verify in POST_DEPLOY).
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [x86_64]
+    Timeout: 30
+    MemorySize: 256
+    Layers: [!Ref SharedLayer]
+    Environment:
+      Variables:
+        TABLE_NAME: !Ref JobsTable
+        # AWS_REGION is a reserved var Lambda sets automatically; config.py reads it.
+        DEV_BASE_URL: https://api.dev.mediaclassifier.dolphin-one.com
+        DEV_API_KEY_SECRET: !Sub "${AWS::StackName}/classifier-dev-api-key"
+        CALLBACK_SECRET_NAME: !Sub "${AWS::StackName}/callback-secret"
+        SUBMIT_GAP_SECONDS: !Ref SubmitGapSeconds
+        STALL_AFTER_SECONDS: "600"
+        POLL_AFTER_SECONDS: "90"
+        CALLBACK_PARAM: !Ref CallbackParam
+        # Any function that finalizes a job (pacer/poller/callback) or is asked to compare
+        # (api) may invoke the compare Lambda, so all of them need its name.
+        COMPARE_FUNCTION_NAME: !Sub "${AWS::StackName}-compare"
+
+Resources:
+  # --- Single table -----------------------------------------------------------
+  JobsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AWS::StackName}-jobs"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: pk, AttributeType: S}
+        - {AttributeName: sk, AttributeType: S}
+        - {AttributeName: classifier_job_id, AttributeType: S}
+        - {AttributeName: result_ref, AttributeType: S}
+        - {AttributeName: submit_state, AttributeType: S}
+        - {AttributeName: state_ts, AttributeType: N}
+      KeySchema:
+        - {AttributeName: pk, KeyType: HASH}
+        - {AttributeName: sk, KeyType: RANGE}
+      GlobalSecondaryIndexes:
+        - IndexName: classifier-job-index
+          KeySchema:
+            - {AttributeName: classifier_job_id, KeyType: HASH}
+            - {AttributeName: result_ref, KeyType: RANGE}
+          Projection: {ProjectionType: KEYS_ONLY}
+        - IndexName: submit-state-index
+          KeySchema:
+            - {AttributeName: submit_state, KeyType: HASH}
+            - {AttributeName: state_ts, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+      TimeToLiveSpecification: {AttributeName: ttl, Enabled: true}
+
+  # --- HTTP API ---------------------------------------------------------------
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: $default   # routes served at the root, so callback URLs have no stage prefix
+
+  # --- Secrets (populate values after deploy — see POST_DEPLOY.md) -------------
+  DevApiKeySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AWS::StackName}/classifier-dev-api-key"
+      Description: x-api-key for the dev media classifier.
+  CallbackSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AWS::StackName}/callback-secret"
+      Description: High-entropy token embedded in the callback URL path.
+      GenerateSecretString: {PasswordLength: 40, ExcludePunctuation: true}
+
+  # --- Shared layer -----------------------------------------------------------
+  SharedLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub "${AWS::StackName}-shared"
+      Description: ct_shared package + deps
+      ContentUri: shared/
+      CompatibleRuntimes: [python3.12]
+      CompatibleArchitectures: [x86_64]
+    Metadata:
+      BuildMethod: makefile
+      BuildArchitecture: x86_64
+
+  # --- Functions --------------------------------------------------------------
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-api"
+      CodeUri: lambdas/api/
+      Handler: handler.handler
+      Policies:
+        - DynamoDBCrudPolicy: {TableName: !Ref JobsTable}
+        - LambdaInvokePolicy: {FunctionName: !Sub "${AWS::StackName}-compare"}
+      Events:
+        CreateJob:
+          Type: HttpApi
+          Properties: {ApiId: !Ref HttpApi, Path: "/jobs", Method: POST}
+        GetJob:
+          Type: HttpApi
+          Properties: {ApiId: !Ref HttpApi, Path: "/jobs/{job_id}", Method: GET}
+        GetResults:
+          Type: HttpApi
+          Properties: {ApiId: !Ref HttpApi, Path: "/jobs/{job_id}/results", Method: GET}
+        CreateCompare:
+          Type: HttpApi
+          Properties: {ApiId: !Ref HttpApi, Path: "/compare", Method: POST}
+        GetCompare:
+          Type: HttpApi
+          Properties: {ApiId: !Ref HttpApi, Path: "/comparisons/{comparison_id}", Method: GET}
+
+  CallbackFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-callback"
+      CodeUri: lambdas/callback/
+      Handler: handler.handler
+      Policies:
+        - DynamoDBCrudPolicy: {TableName: !Ref JobsTable}
+        - LambdaInvokePolicy: {FunctionName: !Sub "${AWS::StackName}-compare"}
+        - Statement:
+            - Effect: Allow
+              Action: [secretsmanager:GetSecretValue]
+              Resource: !Ref CallbackSecret
+      Events:
+        Callback:
+          Type: HttpApi
+          Properties: {ApiId: !Ref HttpApi, Path: "/callback/{secret}", Method: POST}
+
+  PacerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-pacer"
+      CodeUri: lambdas/pacer/
+      Handler: handler.handler
+      Timeout: 70
+      ReservedConcurrentExecutions: 1   # exactly one pacer at a time — a belt for the RATE# CAS
+      Environment:
+        Variables:
+          API_BASE_URL: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+      Policies:
+        - DynamoDBCrudPolicy: {TableName: !Ref JobsTable}
+        - LambdaInvokePolicy: {FunctionName: !Sub "${AWS::StackName}-compare"}
+        - Statement:
+            - Effect: Allow
+              Action: [secretsmanager:GetSecretValue]
+              Resource: [!Ref DevApiKeySecret, !Ref CallbackSecret]
+      Events:
+        Tick: {Type: Schedule, Properties: {Schedule: rate(1 minute), Enabled: false}}  # enable after smoke test
+
+  PollerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-poller"
+      CodeUri: lambdas/poller/
+      Handler: handler.handler
+      Timeout: 60
+      Policies:
+        - DynamoDBCrudPolicy: {TableName: !Ref JobsTable}
+        - LambdaInvokePolicy: {FunctionName: !Sub "${AWS::StackName}-compare"}
+        - Statement:
+            - Effect: Allow
+              Action: [secretsmanager:GetSecretValue]
+              Resource: !Ref DevApiKeySecret
+      Events:
+        Sweep: {Type: Schedule, Properties: {Schedule: rate(2 minutes), Enabled: false}}  # enable after smoke test
+
+  CompareFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-compare"
+      CodeUri: lambdas/compare/
+      Handler: handler.handler
+      Policies:
+        - DynamoDBCrudPolicy: {TableName: !Ref JobsTable}
+
+Outputs:
+  ApiBaseUrl:
+    Description: Base URL of the HTTP API.
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+  TableName:
+    Value: !Ref JobsTable
+  DevApiKeySecretName:
+    Value: !Sub "${AWS::StackName}/classifier-dev-api-key"
