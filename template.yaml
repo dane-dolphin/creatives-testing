@@ -76,6 +76,9 @@ Resources:
     Type: AWS::Serverless::HttpApi
     Properties:
       StageName: $default   # routes served at the root, so callback URLs have no stage prefix
+      Auth:
+        EnableIamAuthorizer: true
+        DefaultAuthorizer: AWS_IAM   # SigV4-signed calls only; the callback route opts out below
 
   # --- Secrets (populate values after deploy — see POST_DEPLOY.md) -------------
   DevApiKeySecret:
@@ -146,7 +149,13 @@ Resources:
       Events:
         Callback:
           Type: HttpApi
-          Properties: {ApiId: !Ref HttpApi, Path: "/callback/{secret}", Method: POST}
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/callback/{secret}"
+            Method: POST
+            # The classifier can't sign SigV4; this route is protected by the
+            # high-entropy secret in the path instead.
+            Auth: {Authorizer: NONE}
 
   PacerFunction:
     Type: AWS::Serverless::Function

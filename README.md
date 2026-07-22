@@ -59,6 +59,32 @@ GSIs: `classifier-job-index` (classifier_job_id → all rows, for the dedup fan-
 | `GET /comparisons/{comparison_id}` | the comparison verdict |
 | `POST /callback/{secret}` | classifier webhook (not for callers) |
 
+### Auth — all routes require AWS IAM (SigV4)
+
+Every route except the webhook callback requires a SigV4-signed request from an IAM
+identity allowed `execute-api:Invoke` (any admin-ish user/role in the account works).
+Unsigned calls get 403 before reaching a Lambda. The callback route is instead
+protected by the high-entropy secret embedded in its path.
+
+With curl (≥ 7.75), using your normal AWS CLI credentials:
+
+```bash
+eval $(aws configure export-credentials --format env)   # loads KEY/SECRET/TOKEN
+
+curl --aws-sigv4 "aws:amz:us-east-1:execute-api" \
+     --user "$AWS_ACCESS_KEY_ID:$AWS_SECRET_ACCESS_KEY" \
+     ${AWS_SESSION_TOKEN:+-H "x-amz-security-token: $AWS_SESSION_TOKEN"} \
+     -XPOST "$API/jobs" -H 'content-type: application/json' \
+     -d '{"urls": ["https://cdn.example.com/a.mp4"]}'
+```
+
+GETs are the same minus the body, e.g. `... "$API/jobs/JOB_ID/results"`.
+
+From Postman: Authorization type **AWS Signature** with AccessKey, SecretKey,
+Region `us-east-1`, Service Name `execute-api` (plus Session Token when using
+temporary/SSO credentials). Any AWS SDK works too — e.g. boto3 with
+`requests-aws4auth`, or `awscurl`.
+
 ## Develop
 
 ```

@@ -2,15 +2,17 @@ version = 0.1
 
 [default.global.parameters]
 stack_name = "creative-tester-dev"
+region = "us-east-1"
 
 [default.build.parameters]
 cached = true
 parallel = true
 
 [default.deploy.parameters]
-stack_name = "creative-tester-dev"
 region = "us-east-1"
 capabilities = "CAPABILITY_IAM CAPABILITY_AUTO_EXPAND"
 resolve_s3 = true
 confirm_changeset = true
-parameter_overrides = "Stage=dev"
+parameter_overrides = "Stage=\"dev\" SubmitGapSeconds=\"18\" CallbackParam=\"callback_url\""
+s3_prefix = "creative-tester-dev"
+image_repositories = []

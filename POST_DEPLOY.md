@@ -22,9 +22,19 @@ aws secretsmanager put-secret-value \
 
 ## 3. Smoke test (schedules still off — drive the Lambdas by hand)
 
+All API routes require SigV4-signed requests (see "Auth" in the README). Load your
+credentials once, then define a signed-curl alias for the calls below:
+
+```
+eval $(aws configure export-credentials --format env)
+sigcurl() { curl -s --aws-sigv4 "aws:amz:us-east-1:execute-api" \
+  --user "$AWS_ACCESS_KEY_ID:$AWS_SECRET_ACCESS_KEY" \
+  ${AWS_SESSION_TOKEN:+-H "x-amz-security-token: $AWS_SESSION_TOKEN"} "$@"; }
+```
+
 ```
 # create a 2-URL batch (one video, one image)
-curl -s -XPOST $API/jobs -H 'content-type: application/json' -d '{
+sigcurl -XPOST $API/jobs -H 'content-type: application/json' -d '{
   "urls": "https://media-cdn.example.com/a.mp4, https://static.example.com/b.jpg"
 }'
 # -> {"job_id":"job_...","enqueued_rows":2,"skipped":[]}
@@ -32,8 +42,8 @@ curl -s -XPOST $API/jobs -H 'content-type: application/json' -d '{
 aws lambda invoke --function-name creative-tester-dev-pacer /dev/stdout   # submit ~1/18s
 # repeat a few times, ~20s apart, until GET below shows rows 'submitted'
 
-curl -s $API/jobs/JOB_ID            # status + counts
-curl -s $API/jobs/JOB_ID/results    # per-row raw_result + norm_tags
+sigcurl $API/jobs/JOB_ID            # status + counts
+sigcurl $API/jobs/JOB_ID/results    # per-row raw_result + norm_tags
 
 aws lambda invoke --function-name creative-tester-dev-poller /dev/stdout   # pull results / mark stalls
 ```
@@ -72,11 +82,11 @@ aws events enable-rule --name <PollerSweepRule>
 ## 6. Comparison (optional)
 
 ```
-curl -s -XPOST $API/compare -H 'content-type: application/json' -d '{
+sigcurl -XPOST $API/compare -H 'content-type: application/json' -d '{
   "left":  {"job_id":"JOB_ID","endpoint":"dev-video","url":"https://.../a.mp4"},
   "right": {"job_id":"JOB_ID","endpoint":"dev-image","url":"https://.../a.mp4"}
 }'
-curl -s $API/comparisons/CMP_ID
+sigcurl $API/comparisons/CMP_ID
 ```
 
 ## Notes / gotchas
